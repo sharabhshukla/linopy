@@ -211,6 +211,11 @@ with contextlib.suppress(ModuleNotFoundError):
     except ImportError:
         pass
 
+with contextlib.suppress(ModuleNotFoundError):
+    from cuopt.linear_programming.problem import Problem as CuOptProblem
+
+    available_solvers.append("cuopt")
+
 
 quadratic_solvers = [s for s in QUADRATIC_SOLVERS if s in available_solvers]
 logger = logging.getLogger(__name__)
@@ -244,6 +249,7 @@ class SolverName(enum.Enum):
     MindOpt = "mindopt"
     PIPS = "pips"
     cuPDLPx = "cupdlpx"
+    CuOpt = "cuopt"
 
 
 def path_to_string(path: Path) -> str:
@@ -2620,3 +2626,242 @@ class cuPDLPx(Solver[None]):
         """
         for k, v in self.solver_options.items():
             cu_model.setParam(k, v)
+
+
+class CuOpt(Solver[None]):
+    """
+    Solver subclass for the NVIDIA cuOpt solver. cuOpt must be installed
+    for usage. Find the documentation at https://docs.nvidia.com/cuopt/.
+
+    cuOpt is a GPU-accelerated optimization engine that supports LP, MILP, and QP.
+    It runs multiple algorithms concurrently (PDLP on GPU, barrier on GPU, dual simplex on CPU)
+    and returns the solution from whichever finishes first.
+
+    The full list of solver options is documented at
+    https://docs.nvidia.com/cuopt/user-guide/latest/cuopt-python/lp-milp/
+
+    Some example options are:
+    * time_limit : Maximum solve time in seconds
+    * mip_gap : Relative MIP gap tolerance
+    * verbose : Enable/disable solver output
+
+    Attributes
+    ----------
+    **solver_options
+        options for the given solver
+    """
+
+    def __init__(
+        self,
+        **solver_options: Any,
+    ) -> None:
+        super().__init__(**solver_options)
+
+    def solve_problem_from_file(
+        self,
+        problem_fn: Path,
+        solution_fn: Path | None = None,
+        log_fn: Path | None = None,
+        warmstart_fn: Path | None = None,
+        basis_fn: Path | None = None,
+        env: None = None,
+    ) -> Result:
+        """
+        Solve a linear problem from a problem file using the cuOpt solver.
+
+        cuOpt's Python API doesn't directly support file reading, so this method
+        reads the file using linopy and converts to cuOpt's format. Only .mps files
+        are supported.
+
+        Parameters
+        ----------
+        problem_fn : Path
+            Path to the problem file (must be .mps format).
+        solution_fn : Path, optional
+            Path to the solution file.
+        log_fn : Path, optional
+            Path to the log file.
+        warmstart_fn : Path, optional
+            Path to the warmstart file.
+        basis_fn : Path, optional
+            Path to the basis file.
+        env : None, optional
+            Environment for the solver
+
+        Returns
+        -------
+        Result
+        """
+        from cuopt.linear_programming.problem import Problem as CuOptProblem
+
+        problem_fn_ = path_to_string(problem_fn)
+        io_api = read_io_api_from_problem_file(problem_fn)
+
+        if io_api != "mps":
+            msg = "cuOpt currently only supports MPS file format for file-based solving."
+            raise ValueError(msg)
+
+        # Read MPS file using cuOpt
+        cuopt_problem = CuOptProblem()
+        cuopt_problem.readMPS(problem_fn_)
+
+        sense = read_sense_from_problem_file(problem_fn)
+
+        return self._solve(
+            cuopt_problem,
+            solution_fn=solution_fn,
+            log_fn=log_fn,
+            warmstart_fn=warmstart_fn,
+            basis_fn=basis_fn,
+            io_api=io_api,
+            sense=sense,
+        )
+
+    def solve_problem_from_model(
+        self,
+        model: Model,
+        solution_fn: Path | None = None,
+        log_fn: Path | None = None,
+        warmstart_fn: Path | None = None,
+        basis_fn: Path | None = None,
+        env: None = None,
+        explicit_coordinate_names: bool = False,
+    ) -> Result:
+        """
+        Solve a linear problem directly from a linopy model using the cuOpt solver.
+
+        Parameters
+        ----------
+        model : linopy.model
+            Linopy model for the problem.
+        solution_fn : Path, optional
+            Path to the solution file.
+        log_fn : Path, optional
+            Path to the log file.
+        warmstart_fn : Path, optional
+            Path to the warmstart file.
+        basis_fn : Path, optional
+            Path to the basis file.
+        env : None, optional
+            Environment for the solver
+        explicit_coordinate_names : bool, optional
+            Transfer variable and constraint names to the solver (default: False)
+
+        Returns
+        -------
+        Result
+        """
+        cuopt_problem = model.to_cuopt(
+            explicit_coordinate_names=explicit_coordinate_names
+        )
+
+        return self._solve(
+            cuopt_problem,
+            solution_fn=solution_fn,
+            log_fn=log_fn,
+            warmstart_fn=warmstart_fn,
+            basis_fn=basis_fn,
+            io_api="direct",
+            sense=model.sense,
+        )
+
+    def _solve(
+        self,
+        cuopt_problem: Any,
+        solution_fn: Path | None = None,
+        log_fn: Path | None = None,
+        warmstart_fn: Path | None = None,
+        basis_fn: Path | None = None,
+        io_api: str | None = None,
+        sense: str | None = None,
+    ) -> Result:
+        """
+        Solve a linear problem from a cuOpt Problem object.
+
+        Parameters
+        ----------
+        cuopt_problem : cuopt.linear_programming.problem.Problem
+            cuOpt Problem object.
+        solution_fn : Path, optional
+            Path to the solution file.
+        log_fn : Path, optional
+            Path to the log file.
+        warmstart_fn : Path, optional
+            Path to the warmstart file.
+        basis_fn : Path, optional
+            Path to the basis file.
+        io_api: str
+            io_api of the problem. For direct API from linopy model this is "direct".
+        sense: str
+            "min" or "max"
+
+        Returns
+        -------
+        Result
+        """
+        from cuopt.linear_programming.solver_settings import SolverSettings
+
+        # Map cuOpt status codes to linopy termination conditions
+        CONDITION_MAP: dict[str, TerminationCondition] = {
+            "Optimal": TerminationCondition.optimal,
+            "Infeasible": TerminationCondition.infeasible,
+            "Unbounded": TerminationCondition.unbounded,
+            "InfeasibleOrUnbounded": TerminationCondition.infeasible_or_unbounded,
+            "TimeLimit": TerminationCondition.time_limit,
+            "IterationLimit": TerminationCondition.iteration_limit,
+            "Error": TerminationCondition.internal_solver_error,
+        }
+
+        # Configure solver settings
+        settings = SolverSettings()
+        for k, v in self.solver_options.items():
+            settings.set_parameter(k, v)
+
+        if log_fn is not None:
+            logger.warning("cuOpt does not support separate log files. Use verbose=True in solver_options to enable console output.")
+
+        if warmstart_fn is not None:
+            logger.warning("Warmstart from file not yet implemented for cuOpt.")
+
+        if basis_fn is not None:
+            logger.warning("Basis files are not supported by cuOpt.")
+
+        # Solve the problem
+        cuopt_problem.solve(settings)
+
+        # Get status
+        status_name = cuopt_problem.Status.name if hasattr(cuopt_problem.Status, "name") else str(cuopt_problem.Status)
+        termination_condition = CONDITION_MAP.get(status_name, TerminationCondition.unknown)
+        status = Status.from_termination_condition(termination_condition)
+        status.legacy_status = status_name
+
+        def get_solver_solution() -> Solution:
+            objective = cuopt_problem.ObjValue
+
+            # Extract variable solutions
+            variables = cuopt_problem.getVariables()
+            sol = pd.Series(
+                {v.name if v.name else f"x{i}": v.getValue() for i, v in enumerate(variables)},
+                dtype=float
+            )
+
+            # Extract dual values (constraint multipliers)
+            constraints = cuopt_problem.getConstraints()
+            try:
+                dual = pd.Series(
+                    {c.name if c.name else f"c{i}": c.getDual() for i, c in enumerate(constraints)},
+                    dtype=float
+                )
+            except (AttributeError, Exception):
+                logger.warning("Dual values could not be parsed (might be MILP)")
+                dual = pd.Series(dtype=float)
+
+            return Solution(sol, dual, objective)
+
+        if solution_fn is not None:
+            logger.warning("Solution file output not yet implemented for cuOpt.")
+
+        solution = self.safe_get_solution(status=status, func=get_solver_solution)
+        solution = maybe_adjust_objective_sign(solution, io_api, sense)
+
+        return Result(status, solution, cuopt_problem)

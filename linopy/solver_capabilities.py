@@ -234,6 +234,20 @@ SOLVER_REGISTRY: dict[str, SolverInfo] = {
             }
         ),
     ),
+    "cuopt": SolverInfo(
+        name="cuopt",
+        display_name="NVIDIA cuOpt",
+        features=frozenset(
+            {
+                SolverFeature.INTEGER_VARIABLES,
+                SolverFeature.QUADRATIC_OBJECTIVE,
+                SolverFeature.DIRECT_API,
+                SolverFeature.READ_MODEL_FROM_FILE,
+                SolverFeature.GPU_ACCELERATION,
+                SolverFeature.SOLUTION_FILE_NOT_NEEDED,
+            }
+        ),
+    ),
 }
 
 

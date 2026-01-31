@@ -935,6 +935,127 @@ def to_cupdlpx(m: Model, explicit_coordinate_names: bool = False) -> cupdlpxMode
     return cu_model
 
 
+def to_cuopt(m: Model, explicit_coordinate_names: bool = False) -> Any:
+    """
+    Export the model to NVIDIA cuOpt.
+
+    This function does not write the model to intermediate files but directly
+    converts the linopy model to a cuOpt Problem object using the cuOpt API.
+
+    Parameters
+    ----------
+    m : linopy.Model
+        The linopy model to export
+    explicit_coordinate_names : bool, optional
+        Whether to use explicit coordinate names for variables and constraints.
+        Default is False.
+
+    Returns
+    -------
+    problem : cuopt.linear_programming.problem.Problem
+        The cuOpt Problem object
+    """
+    from cuopt.linear_programming.problem import (
+        CONTINUOUS,
+        INTEGER,
+        MAXIMIZE,
+        MINIMIZE,
+        Problem,
+    )
+
+    if m.variables.sos:
+        raise NotImplementedError(
+            "SOS constraints are not supported by cuOpt direct API."
+        )
+
+    print_variable, print_constraint = get_printers_scalar(
+        m, explicit_coordinate_names=explicit_coordinate_names
+    )
+
+    M = m.matrices
+
+    # Create cuOpt problem
+    problem = Problem(m.objective.name if m.objective.name else "linopy_model")
+
+    # Add variables
+    var_map = {}  # Map from linopy variable index to cuOpt variable
+    for i, (vlabel, lb, ub) in enumerate(zip(M.vlabels, M.lb, M.ub)):
+        vtype = M.vtypes[i] if hasattr(M, "vtypes") and M.vtypes is not None else "C"
+        var_name = print_variable(vlabel) if explicit_coordinate_names else f"x{i}"
+
+        if vtype == "B":
+            # Binary variable
+            cuopt_var = problem.addVariable(lb=0, ub=1, vtype=INTEGER, name=var_name)
+        elif vtype == "I":
+            # Integer variable
+            cuopt_var = problem.addVariable(
+                lb=float(lb), ub=float(ub), vtype=INTEGER, name=var_name
+            )
+        else:
+            # Continuous variable
+            cuopt_var = problem.addVariable(
+                lb=float(lb), ub=float(ub), vtype=CONTINUOUS, name=var_name
+            )
+
+        var_map[i] = cuopt_var
+
+    # Add linear constraints
+    A = M.A
+    if A is not None:
+        A = A.tocsr()
+        for i in range(A.shape[0]):
+            # Build linear expression for constraint
+            row_start = A.indptr[i]
+            row_end = A.indptr[i + 1]
+            indices = A.indices[row_start:row_end]
+            data = A.data[row_start:row_end]
+
+            # Create linear expression
+            expr = sum(
+                float(coeff) * var_map[int(idx)] for idx, coeff in zip(indices, data)
+            )
+
+            # Get constraint sense and RHS
+            sense = M.sense[i]
+            rhs = float(M.b[i])
+
+            # Add constraint based on sense
+            constr_name = (
+                print_constraint(M.clabels[i])
+                if explicit_coordinate_names
+                else f"c{i}"
+            )
+
+            if sense == "=":
+                problem.addConstraint(expr == rhs, name=constr_name)
+            elif sense == "<" or sense == "<=":
+                problem.addConstraint(expr <= rhs, name=constr_name)
+            elif sense == ">" or sense == ">=":
+                problem.addConstraint(expr >= rhs, name=constr_name)
+
+    # Set linear objective
+    obj_expr = sum(float(M.c[i]) * var_map[i] for i in range(len(M.c)) if M.c[i] != 0)
+
+    # Add quadratic terms if present
+    Q = M.Q
+    if Q is not None:
+        Q = triu(Q)
+        Q = Q.tocoo()
+        for i, j, v in zip(Q.row, Q.col, Q.data):
+            if i == j:
+                # Diagonal term: 0.5 * v * x_i^2
+                obj_expr += 0.5 * float(v) * var_map[int(i)] * var_map[int(i)]
+            else:
+                # Off-diagonal term: v * x_i * x_j
+                obj_expr += float(v) * var_map[int(i)] * var_map[int(j)]
+
+    # Set objective sense
+    obj_sense = MAXIMIZE if m.objective.sense == "max" else MINIMIZE
+    problem.setObjective(obj_expr, sense=obj_sense)
+
+    return problem
+
+
 def to_block_files(m: Model, fn: Path) -> None:
     """
     Write out the linopy model to a block structured output.
